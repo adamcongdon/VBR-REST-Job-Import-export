@@ -442,6 +442,153 @@ Describe 'Invoke-VbrMigration' {
         }
     }
 
+    Context 'logging' {
+
+        It 'accepts -LogPath parameter' {
+            $cmd = Get-Command -Name Invoke-VbrMigration -Module VbrAutomationMigrate
+            $cmd.Parameters.Keys | Should -Contain 'LogPath'
+        }
+
+        It 'creates a log file at the default path under WorkingDirectory when -LogPath is omitted' {
+            $result = Invoke-VbrMigration `
+                -SourceBaseUri 'https://src.test:9419' `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -SourceCredential $script:srcCred `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            $logFiles = Get-ChildItem -LiteralPath $script:tmpDir -Filter 'vbr-migration-*.log' -File
+            $logFiles.Count | Should -BeGreaterOrEqual 1
+            $result.LogPath | Should -Match 'vbr-migration-.*\.log$'
+        }
+
+        It 'returns the log path on the result object' {
+            $result = Invoke-VbrMigration `
+                -SourceBaseUri 'https://src.test:9419' `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -SourceCredential $script:srcCred `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            $result.LogPath | Should -Not -BeNullOrEmpty
+            Test-Path -LiteralPath $result.LogPath | Should -BeTrue
+        }
+
+        It 'writes the expected phase markers to the log file' {
+            $logPath = Join-Path $script:tmpDir 'phases.log'
+            $null = Invoke-VbrMigration `
+                -SourceBaseUri 'https://src.test:9419' `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -SourceCredential $script:srcCred `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -LogPath $logPath `
+                -SkipCertificateCheck
+
+            $content = Get-Content -LiteralPath $logPath -Raw
+            $content | Should -Match 'phase=auth-source'
+            $content | Should -Match 'phase=export-source'
+            $content | Should -Match 'phase=persist'
+            $content | Should -Match 'phase=auth-target'
+            $content | Should -Match 'phase=import-target'
+            $content | Should -Match 'phase=complete'
+        }
+
+        It 'does not contain bearer tokens, password values, or access_token strings in the log' {
+            $logPath = Join-Path $script:tmpDir 'redaction.log'
+            $null = Invoke-VbrMigration `
+                -SourceBaseUri 'https://src.test:9419' `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -SourceCredential $script:srcCred `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -LogPath $logPath `
+                -SkipCertificateCheck
+
+            $content = Get-Content -LiteralPath $logPath -Raw
+            # The fake token in test helpers is 'FAKE.JWT.TOKEN.VALUE'; the credential password is 'pw'.
+            # Even if a future bug pushed Bearer/access_token through, redaction should mask it.
+            $content | Should -Not -Match 'Bearer\s+FAKE\.JWT'
+            $content | Should -Not -Match 'access_token\s*[:=]\s*[^<]+sekret'
+        }
+
+        It 'logs an [ERROR] phase=auth-target line when target Get-VbrToken throws' {
+            Mock -ModuleName VbrAutomationMigrate -CommandName Get-VbrToken -MockWith {
+                param([uri]$BaseUri, [pscredential]$Credential, [switch]$SkipCertificateCheck)
+                if ("$BaseUri" -like '*tgt.test*') {
+                    throw 'No such host is known.'
+                }
+                return New-FakeVbrToken -BaseUri $BaseUri
+            }
+
+            $logPath = Join-Path $script:tmpDir 'tgt-fail.log'
+            try {
+                Invoke-VbrMigration `
+                    -SourceBaseUri 'https://src.test:9419' `
+                    -TargetBaseUri 'https://tgt.test:9419' `
+                    -SourceCredential $script:srcCred `
+                    -TargetCredential $script:tgtCred `
+                    -WorkingDirectory $script:tmpDir `
+                    -LogPath $logPath `
+                    -SkipCertificateCheck
+            } catch { }
+
+            Test-Path -LiteralPath $logPath | Should -BeTrue
+            $content = Get-Content -LiteralPath $logPath -Raw
+            $content | Should -Match '\[ERROR\].*phase=auth-target'
+        }
+
+        It 'disables file logging entirely when -LogPath is /dev/null' {
+            $null = Invoke-VbrMigration `
+                -SourceBaseUri 'https://src.test:9419' `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -SourceCredential $script:srcCred `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -LogPath '/dev/null' `
+                -SkipCertificateCheck
+
+            # No vbr-migration-*.log file should have been created in WorkingDirectory.
+            $logFiles = Get-ChildItem -LiteralPath $script:tmpDir -Filter 'vbr-migration-*.log' -File -ErrorAction SilentlyContinue
+            $logFiles.Count | Should -Be 0
+        }
+    }
+
+    Context 'null-token halt' {
+
+        It 'throws before any Import-Vbr* runs when target Get-VbrToken returns null' {
+            Mock -ModuleName VbrAutomationMigrate -CommandName Get-VbrToken -MockWith {
+                param([uri]$BaseUri, [pscredential]$Credential, [switch]$SkipCertificateCheck)
+                if ("$BaseUri" -like '*tgt.test*') {
+                    return $null
+                }
+                return New-FakeVbrToken -BaseUri $BaseUri
+            }
+
+            $err = $null
+            try {
+                Invoke-VbrMigration `
+                    -SourceBaseUri 'https://src.test:9419' `
+                    -TargetBaseUri 'https://tgt.test:9419' `
+                    -SourceCredential $script:srcCred `
+                    -TargetCredential $script:tgtCred `
+                    -WorkingDirectory $script:tmpDir `
+                    -SkipCertificateCheck
+            } catch { $err = $_ }
+
+            $err | Should -Not -BeNullOrEmpty
+            # Exception message must reference the target base URI.
+            $err.Exception.Message | Should -Match 'tgt\.test'
+
+            # And NO Import-Vbr* should have run.
+            foreach ($cmd in 'Import-VbrCredentials','Import-VbrCloudCredentials','Import-VbrEncryptionPasswords','Import-VbrManagedServers','Import-VbrRepositories','Import-VbrProxies','Import-VbrJobs') {
+                Should -Invoke -ModuleName VbrAutomationMigrate -CommandName $cmd -Times 0 -Exactly
+            }
+        }
+    }
+
     Context 'parameter set validation' {
 
         It 'throws when both -ExportOnly and -ResumeFromImport are passed' {

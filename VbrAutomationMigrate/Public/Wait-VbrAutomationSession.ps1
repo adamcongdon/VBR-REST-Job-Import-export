@@ -53,11 +53,14 @@ function Wait-VbrAutomationSession {
         [int] $TimeoutSeconds = 1800
     )
 
-    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $startUtc = [datetime]::UtcNow
+    $deadline = $startUtc.AddSeconds($TimeoutSeconds)
     $path = "/api/v1/automation/sessions/$SessionId"
+    $attempt = 0
 
     while ($true) {
         $session = Invoke-VbrApi -Token $Token -Method 'GET' -Path $path
+        $attempt++
 
         # Validate the session payload has a 'state' property before reading
         # it. Without this, a malformed response would fall through to the
@@ -87,12 +90,31 @@ function Wait-VbrAutomationSession {
 
         $state = [string]$session.state
 
+        $elapsedSec = [int]([datetime]::UtcNow - $startUtc).TotalSeconds
+        Write-VbrLog -Level 'Debug' -Context @{
+            session = $SessionId
+            state   = $state
+            attempt = $attempt
+            elapsed = "${elapsedSec}s"
+        } -Message ''
+
         switch ($state) {
             'Succeeded' { return $session }
             { $_ -in 'Failed','Stopped','Canceled' } {
                 # Single branch handling all three terminal failure states.
                 # Error id is suffixed with the state so callers can still
                 # discriminate (VbrSessionTerminated.Failed / .Stopped / .Canceled).
+                $details = ''
+                if ($session.PSObject.Properties.Match('result').Count -and $session.result) {
+                    if ($session.result.PSObject.Properties.Match('message').Count) {
+                        $details = [string]$session.result.message
+                    }
+                }
+                Write-VbrLog -Level 'Error' -Context @{
+                    session = $SessionId
+                    state   = $state
+                    details = if ($details) { $details } else { '<none>' }
+                } -Message ''
                 $err = [System.Management.Automation.ErrorRecord]::new(
                     [System.Exception]::new("VBR session $SessionId terminated with state $state."),
                     "VbrSessionTerminated.$state",
@@ -104,6 +126,11 @@ function Wait-VbrAutomationSession {
             default {
                 # Working / unknown -- keep polling.
                 if ([datetime]::UtcNow -ge $deadline) {
+                    Write-VbrLog -Level 'Error' -Context @{
+                        session       = $SessionId
+                        'timeout-after' = "${TimeoutSeconds}s"
+                        last_state    = $state
+                    } -Message ''
                     $msg = "Wait-VbrAutomationSession: timed out after ${TimeoutSeconds}s waiting for session $SessionId (last state: $state)."
                     $err = [System.Management.Automation.ErrorRecord]::new(
                         [System.TimeoutException]::new($msg),

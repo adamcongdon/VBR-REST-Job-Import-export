@@ -143,18 +143,70 @@ function Invoke-VbrApi {
 
     Write-Verbose ("Invoke-VbrApi {0} {1}" -f $Method, $fullUri)
 
-    try {
-        return Invoke-RestMethod @irmParams
-    } catch {
-        # On 401 with a token in hand, attempt one refresh + retry.
-        $isUnauthorized = $false
-        if ($_.Exception -and $_.Exception.Response) {
-            try {
-                if ([int]$_.Exception.Response.StatusCode -eq 401) { $isUnauthorized = $true }
-            } catch { $isUnauthorized = $false }
+    # Only build the body-summary string and time the call when a log target
+    # is actually set. Skips per-call serialization when logging is disabled.
+    $logActive = (-not [string]::IsNullOrWhiteSpace($script:VbrLogPath)) -and ($script:VbrLogPath -ne '/dev/null')
+
+    if ($logActive) {
+        # OAuth token endpoint posts the user's password in form-encoded text.
+        # Never log that body. Cap other bodies at 500 chars so full job specs
+        # don't bloat the log; Write-VbrLog still redacts password=, passphrase=,
+        # privateKey=, and access_token from whatever survives.
+        $bodyLogValue = '<none>'
+        if ($null -ne $bodyToSend) {
+            if ($pathStr -ieq '/api/oauth2/token') {
+                $bodyLogValue = '<redacted oauth-credentials>'
+            } else {
+                $bs = [string]$bodyToSend
+                if ($bs.Length -gt 500) { $bs = $bs.Substring(0, 500) + '...<truncated>' }
+                $bodyLogValue = $bs
+            }
         }
+        Write-VbrLog -Level 'Debug' -Context @{
+            http = "$Method $pathStr"
+            body = $bodyLogValue
+        } -Message ''
+    }
+
+    $startedUtc = if ($logActive) { [datetime]::UtcNow } else { $null }
+    try {
+        $result = Invoke-RestMethod @irmParams
+        if ($logActive) {
+            $elapsedMs = [int]([datetime]::UtcNow - $startedUtc).TotalMilliseconds
+            # Re-serialize the response to estimate byte size cheaply -- avoids
+            # hooking the response stream at the cost of one ConvertTo-VbrJson.
+            $bytes = 0
+            try {
+                if ($null -ne $result) {
+                    $bytes = ([string](ConvertTo-VbrJson -InputObject $result)).Length
+                }
+            } catch { $bytes = 0 }
+            Write-VbrLog -Level 'Debug' -Context @{
+                http     = "$Method $pathStr"
+                status   = 200
+                duration = "${elapsedMs}ms"
+                bytes    = $bytes
+            } -Message ''
+        }
+        return $result
+    } catch {
+        # Capture status code for log context (best-effort -- not all errors carry one).
+        $statusCode = 0
+        if ($_.Exception -and $_.Exception.Response) {
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
+        }
+
+        # On 401 with a token in hand, attempt one refresh + retry.
+        $isUnauthorized = ($statusCode -eq 401)
         if ($isUnauthorized -and $Token -and $Token.Credential -and -not $NoAuth) {
             Write-Verbose 'Invoke-VbrApi: 401 -- refreshing token and retrying once.'
+            if ($logActive) {
+                Write-VbrLog -Level 'Debug' -Context @{
+                    http   = "$Method $pathStr"
+                    status = 401
+                    action = 'refresh-and-retry'
+                } -Message ''
+            }
             $fresh = Get-VbrToken -BaseUri $Token.BaseUri -Credential $Token.Credential -SkipCertificateCheck:$Token.SkipCertificateCheck
             $Token.AccessToken = $fresh.AccessToken
             $Token.ExpiresAt   = $fresh.ExpiresAt
@@ -162,6 +214,14 @@ function Invoke-VbrApi {
             $authHeader = New-VbrAuthHeader -Token $Token
             foreach ($k in $authHeader.Keys) { $irmParams.Headers[$k] = $authHeader[$k] }
             return Invoke-RestMethod @irmParams
+        }
+
+        if ($logActive) {
+            Write-VbrLog -Level 'Error' -Context @{
+                http   = "$Method $pathStr"
+                status = $statusCode
+                error  = ([string]$_.Exception.Message)
+            } -Message ''
         }
         throw
     }
