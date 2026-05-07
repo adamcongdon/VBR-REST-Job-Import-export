@@ -54,14 +54,66 @@ You should see 18 exported functions covering token issue, seven exports, seven 
 
 ---
 
-## Quick start -- end-to-end migration
+## Quick start -- two-stage migration (recommended)
+
+The recommended workflow for production migrations is **two stages with manual verification in between**. Stage 1 dumps everything from source to JSON files and stops. You inspect the files (and crucially populate empty credential passwords) yourself. Stage 2 reads those JSON files and pushes them into the target.
+
+### Stage 1 -- export only
+
+Run on a host that can reach the **source** VBR server:
 
 ```powershell
 Import-Module ./VbrAutomationMigrate -Force
 
 $srcCred = Get-Credential -Message 'Source VBR admin'
+
+Invoke-VbrMigration -ExportOnly `
+    -SourceBaseUri    'https://src-vbr.example.com:9419' `
+    -SourceCredential $srcCred `
+    -WorkingDirectory ./migration `
+    -SkipCertificateCheck `
+    -Verbose
+```
+
+This authenticates to source, exports the seven resources (credentials, cloud credentials, encryption passwords, managed servers, repositories, proxies, jobs), writes UTF-8 (no BOM) JSON to `./migration/`, runs the empty-password check, and **returns**. No target token is requested. No imports run.
+
+The returned object exposes `SourceBaseUri`, `WorkingDirectory`, `Files` (the seven file paths), and a null `Sessions`.
+
+### Manual verification (do this between stages)
+
+1. **Inspect the seven JSON files in `-WorkingDirectory`.** Confirm the resource counts and names match what you expect to migrate. There should be one file per resource: `credentials.json`, `cloudCredentials.json`, `encryptionPasswords.json`, `managedServers.json`, `repositories.json`, `proxies.json`, `jobs.json`.
+2. **Open `credentials.json` and populate every empty `password` / `passphrase` / `privateKey` field flagged by the empty-password warning.** The Automation REST API does not return secrets in exports, so every credential entry comes back blank for those fields. Stage 2 will re-emit the warning, but the import will succeed even with empty secrets -- jobs that depend on those credentials will then fail to run on target until you either edit the JSON now or repopulate via the VBR console after the import. Editing now is the cleaner path.
+3. **If the target VBR server has different mount-host names**, edit `repositories.json` and retarget `mountServer.mountServerName` for any repository whose mount host changed.
+4. **On the target VBR console, delete the default backup repository and any default proxies** so the imported ones do not collide on name. (See "Pre-flight on the target VBR server" below for context.)
+
+### Stage 2 -- resume from import
+
+Run on a host that can reach the **target** VBR server (typically the target VBR host itself, or a workstation inside its VPN):
+
+```powershell
+Import-Module ./VbrAutomationMigrate -Force
+
 $tgtCred = Get-Credential -Message 'Target VBR admin'
 
+Invoke-VbrMigration -ResumeFromImport `
+    -TargetBaseUri    'https://tgt-vbr.example.com:9419' `
+    -TargetCredential $tgtCred `
+    -WorkingDirectory ./migration `
+    -SkipCertificateCheck `
+    -Verbose
+```
+
+This reads the seven JSON files from `./migration/`, re-runs the empty-password check (so any still-empty credentials are flagged again), authenticates to target, and imports all seven resources in mandatory dependency order: credentials -> cloudCredentials -> encryptionPasswords -> managedServers -> repositories -> proxies -> jobs. After each import it polls `/api/v1/automation/sessions/{id}` and halts on the first `Failed` / `Stopped` / `Canceled`.
+
+If any single import session fails, the orchestrator throws. Fix the underlying issue and re-run with `-ResumeFromImport` again -- the JSON files in `-WorkingDirectory` are still the source of truth.
+
+---
+
+## Single-pass mode (if you trust the export contents)
+
+If you trust the export contents and want to skip the manual verification step, you can run the whole migration in one shot. **This is NOT the recommended path for production migrations** -- it gives you no opportunity to populate empty credential passwords or retarget mount hosts before they hit the target.
+
+```powershell
 Invoke-VbrMigration `
     -SourceBaseUri    'https://src-vbr.example.com:9419' `
     -TargetBaseUri    'https://tgt-vbr.example.com:9419' `
@@ -88,7 +140,7 @@ If any single import session fails, the orchestrator throws and downstream resou
 
 ## Lower-level usage
 
-You can also drive the individual functions directly. Sketch:
+For advanced callers who want to drive specific resources only, every export, import, token, and helper is also exposed as a public function. Sketch:
 
 ```powershell
 $srcToken = Get-VbrToken -BaseUri 'https://src:9419' -Credential $srcCred -SkipCertificateCheck
@@ -99,6 +151,12 @@ $tgtToken = Get-VbrToken -BaseUri 'https://tgt:9419' -Credential $tgtCred -SkipC
 $session  = Import-VbrJobs -Token $tgtToken -Spec $jobs
 $result   = Wait-VbrAutomationSession -Token $tgtToken -SessionId $session.id
 ```
+
+In addition to the 7 `Export-Vbr*` and 7 `Import-Vbr*` functions, the module exposes:
+
+- `Get-VbrToken` -- OAuth2 password-grant authentication; returns a typed `[VbrToken]`.
+- `Wait-VbrAutomationSession` -- polls `/api/v1/automation/sessions/{id}` until the session reaches a terminal state; throws on `Failed` / `Stopped` / `Canceled`.
+- `Test-VbrCredentialPasswords` -- inspects a credentials export and emits one `Write-Warning` listing every credential whose `password` / `passphrase` / `privateKey` is empty. Used by `Invoke-VbrMigration` in every mode.
 
 ---
 
@@ -113,9 +171,9 @@ Before running the import, on the target VBR console:
 
 ## Empty passwords
 
-`Export-VbrCredentials` returns credentials with empty `password`/`passphrase`/`privateKey` fields -- the API does not export secrets. After import, every flagged credential must be repopulated on the target VBR server (via the VBR console or PowerShell SDK) before any backup job that uses it will run successfully.
+`Export-VbrCredentials` returns credentials with empty `password`/`passphrase`/`privateKey` fields -- the API does not export secrets. Every flagged credential must be repopulated **before any backup job that uses it will run successfully**. The clean place to do this is in step 2 of the [Manual verification](#manual-verification-do-this-between-stages) section above, by editing `credentials.json` between Stage 1 and Stage 2. Alternatively, you can let the import run with empty secrets and repopulate them on the target VBR server afterwards (via the VBR console or PowerShell SDK).
 
-`Test-VbrCredentialPasswords` and `Invoke-VbrMigration` both surface this with `Write-Warning` listing the affected names. Migration does **not** auto-fail on missing secrets -- you decide.
+`Test-VbrCredentialPasswords` and `Invoke-VbrMigration` (in every mode) surface this with `Write-Warning` listing the affected names. Migration does **not** auto-fail on missing secrets -- you decide.
 
 ---
 
@@ -143,7 +201,7 @@ cd VbrAutomationMigrate
 Invoke-Pester -Path Tests/ -Output Detailed
 ```
 
-149 tests across 18 files (Pester 5.7+).
+162 tests across 18 files (Pester 5.7+).
 
 ---
 
@@ -164,7 +222,7 @@ VBR-REST-Job-Import-export/
 |   |-- VbrAutomationMigrate.psm1
 |   |-- Public/                       # 18 exported functions
 |   |-- Private/                      # 5 internal helpers
-|   |-- Tests/                        # 18 .Tests.ps1 files (149 tests)
+|   |-- Tests/                        # 18 .Tests.ps1 files (162 tests)
 |   |-- en-US/about_VbrAutomationMigrate.help.txt
 |-- Plans/upgrade-plan.md
 |-- README.md

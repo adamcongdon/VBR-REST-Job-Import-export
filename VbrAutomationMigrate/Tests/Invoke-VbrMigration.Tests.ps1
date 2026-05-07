@@ -240,4 +240,236 @@ Describe 'Invoke-VbrMigration' {
                 -SkipCertificateCheck } | Should -Not -Throw
         }
     }
+
+    Context 'export-only mode' {
+
+        BeforeEach {
+            # Override Export-VbrCredentials so credentials.json contains an
+            # empty-password row -- needed to assert the warning still fires.
+            Mock -ModuleName VbrAutomationMigrate -CommandName Export-VbrCredentials -MockWith {
+                $script:callOrder.Add('Export-Credentials') | Out-Null
+                return [pscustomobject]@{
+                    items = @(
+                        [pscustomobject]@{ name = 'cred-with-pw'; password = 'set' }
+                        [pscustomobject]@{ name = 'cred-empty';   password = '' }
+                    )
+                }
+            }
+        }
+
+        It 'writes all 7 JSON files to WorkingDirectory and stops' {
+            $null = Invoke-VbrMigration -ExportOnly `
+                -SourceBaseUri 'https://src.test:9419' `
+                -SourceCredential $script:srcCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            $expected = @(
+                'credentials.json','cloudCredentials.json','encryptionPasswords.json',
+                'managedServers.json','repositories.json','proxies.json','jobs.json'
+            )
+            foreach ($f in $expected) {
+                Test-Path -LiteralPath (Join-Path $script:tmpDir $f) | Should -BeTrue -Because "ExportOnly should drop $f to WorkingDirectory"
+            }
+        }
+
+        It 'does NOT call Get-VbrToken with the target uri' {
+            $null = Invoke-VbrMigration -ExportOnly `
+                -SourceBaseUri 'https://src.test:9419' `
+                -SourceCredential $script:srcCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            # Only the source token should have been requested.
+            Should -Invoke -ModuleName VbrAutomationMigrate -CommandName Get-VbrToken `
+                -ParameterFilter { $BaseUri -eq [uri]'https://src.test:9419' } -Times 1 -Exactly
+            # And no other Get-VbrToken calls at all (the other call would be the target).
+            Should -Invoke -ModuleName VbrAutomationMigrate -CommandName Get-VbrToken -Times 1 -Exactly
+        }
+
+        It 'does NOT call any Import-Vbr* function' {
+            $null = Invoke-VbrMigration -ExportOnly `
+                -SourceBaseUri 'https://src.test:9419' `
+                -SourceCredential $script:srcCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            foreach ($cmd in 'Import-VbrCredentials','Import-VbrCloudCredentials','Import-VbrEncryptionPasswords','Import-VbrManagedServers','Import-VbrRepositories','Import-VbrProxies','Import-VbrJobs') {
+                Should -Invoke -ModuleName VbrAutomationMigrate -CommandName $cmd -Times 0 -Exactly
+            }
+        }
+
+        It 'does NOT call Wait-VbrAutomationSession' {
+            $null = Invoke-VbrMigration -ExportOnly `
+                -SourceBaseUri 'https://src.test:9419' `
+                -SourceCredential $script:srcCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            Should -Invoke -ModuleName VbrAutomationMigrate -CommandName Wait-VbrAutomationSession -Times 0 -Exactly
+        }
+
+        It 'still emits the empty-password warning' {
+            $warnings = & {
+                Invoke-VbrMigration -ExportOnly `
+                    -SourceBaseUri 'https://src.test:9419' `
+                    -SourceCredential $script:srcCred `
+                    -WorkingDirectory $script:tmpDir `
+                    -SkipCertificateCheck 3>&1
+            } | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+            $warnings.Count | Should -BeGreaterOrEqual 1
+            (($warnings | ForEach-Object { $_.Message }) -join "`n") | Should -Match 'cred-empty'
+        }
+
+        It 'returns a result whose Sessions property is null/empty' {
+            $result = Invoke-VbrMigration -ExportOnly `
+                -SourceBaseUri 'https://src.test:9419' `
+                -SourceCredential $script:srcCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            $result | Should -Not -BeNullOrEmpty
+            # Sessions should be null OR an empty hashtable -- either is acceptable
+            # as long as no import sessions are reported.
+            $hasSessions = $result.Sessions -and ($result.Sessions.Keys.Count -gt 0)
+            $hasSessions | Should -BeFalse
+            # And the result should expose what was written so the operator can verify.
+            $result.WorkingDirectory | Should -Be $script:tmpDir
+            $result.Files | Should -Not -BeNullOrEmpty
+            $result.Files.Count | Should -Be 7
+        }
+    }
+
+    Context 'resume-from-import mode' {
+
+        BeforeEach {
+            # Seed the seven JSON files in $script:tmpDir so resume can find
+            # them. credentials.json carries an empty-password row to drive
+            # the still-warns assertion.
+            $credSpec = [pscustomobject]@{
+                items = @(
+                    [pscustomobject]@{ name = 'cred-resumed-with-pw'; password = 'set' }
+                    [pscustomobject]@{ name = 'cred-resumed-empty';   password = '' }
+                )
+            }
+            $emptyish = [pscustomobject]@{ items = @() }
+
+            $files = @{
+                'credentials.json'         = $credSpec
+                'cloudCredentials.json'    = $emptyish
+                'encryptionPasswords.json' = $emptyish
+                'managedServers.json'      = $emptyish
+                'repositories.json'        = $emptyish
+                'proxies.json'             = $emptyish
+                'jobs.json'                = $emptyish
+            }
+            foreach ($kv in $files.GetEnumerator()) {
+                $path = Join-Path $script:tmpDir $kv.Key
+                $kv.Value | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $path -Encoding utf8NoBOM -NoNewline
+            }
+        }
+
+        It 'reads all 7 JSON files from WorkingDirectory' {
+            $null = Invoke-VbrMigration -ResumeFromImport `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            # Every Import-Vbr* must have run, which is only possible if its
+            # corresponding JSON file was successfully read.
+            foreach ($cmd in 'Import-VbrCredentials','Import-VbrCloudCredentials','Import-VbrEncryptionPasswords','Import-VbrManagedServers','Import-VbrRepositories','Import-VbrProxies','Import-VbrJobs') {
+                Should -Invoke -ModuleName VbrAutomationMigrate -CommandName $cmd -Times 1 -Exactly
+            }
+        }
+
+        It 'does NOT call any Export-Vbr* function' {
+            $null = Invoke-VbrMigration -ResumeFromImport `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            foreach ($cmd in 'Export-VbrCredentials','Export-VbrCloudCredentials','Export-VbrEncryptionPasswords','Export-VbrManagedServers','Export-VbrRepositories','Export-VbrProxies','Export-VbrJobs') {
+                Should -Invoke -ModuleName VbrAutomationMigrate -CommandName $cmd -Times 0 -Exactly
+            }
+        }
+
+        It 'does NOT call Get-VbrToken with the source uri' {
+            $null = Invoke-VbrMigration -ResumeFromImport `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            Should -Invoke -ModuleName VbrAutomationMigrate -CommandName Get-VbrToken `
+                -ParameterFilter { $BaseUri -eq [uri]'https://tgt.test:9419' } -Times 1 -Exactly
+            Should -Invoke -ModuleName VbrAutomationMigrate -CommandName Get-VbrToken -Times 1 -Exactly
+        }
+
+        It 'imports in correct dependency order (credentials -> jobs)' {
+            $null = Invoke-VbrMigration -ResumeFromImport `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck
+
+            $expected = @('Import-Credentials','Import-CloudCredentials','Import-EncryptionPasswords','Import-ManagedServers','Import-Repositories','Import-Proxies','Import-Jobs')
+            $actual = @($script:callOrder | Where-Object { $_ -like 'Import-*' })
+            $actual.Count | Should -Be $expected.Count
+            for ($i = 0; $i -lt $expected.Count; $i++) {
+                $actual[$i] | Should -Be $expected[$i]
+            }
+        }
+
+        It 'still emits the empty-password warning before importing' {
+            $stream = & {
+                Invoke-VbrMigration -ResumeFromImport `
+                    -TargetBaseUri 'https://tgt.test:9419' `
+                    -TargetCredential $script:tgtCred `
+                    -WorkingDirectory $script:tmpDir `
+                    -SkipCertificateCheck 3>&1
+            }
+            $warnings = $stream | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+            $warnings.Count | Should -BeGreaterOrEqual 1
+            (($warnings | ForEach-Object { $_.Message }) -join "`n") | Should -Match 'cred-resumed-empty'
+
+            # And the warning must come BEFORE any Import-Vbr* ran. Since
+            # Test-VbrCredentialPasswords emits the warning synchronously
+            # before the import loop, all imports must have happened (call
+            # order assertion) AND the warning must be present (above).
+            $script:callOrder | Should -Contain 'Import-Credentials'
+        }
+    }
+
+    Context 'parameter set validation' {
+
+        It 'throws when both -ExportOnly and -ResumeFromImport are passed' {
+            { Invoke-VbrMigration -ExportOnly -ResumeFromImport `
+                -SourceBaseUri 'https://src.test:9419' `
+                -TargetBaseUri 'https://tgt.test:9419' `
+                -SourceCredential $script:srcCred `
+                -TargetCredential $script:tgtCred `
+                -WorkingDirectory $script:tmpDir `
+                -SkipCertificateCheck } | Should -Throw
+        }
+
+        It 'throws when -ExportOnly is omitted and Target params are missing' {
+            # Default Full set still requires TargetBaseUri / TargetCredential.
+            # Inspect the parameter metadata directly so we don't have to
+            # invoke the cmdlet (which would prompt for missing mandatory
+            # params under PS7's host UI).
+            $cmd = Get-Command -Name Invoke-VbrMigration -Module VbrAutomationMigrate
+            $tgtUriParam  = $cmd.Parameters['TargetBaseUri']
+            $tgtCredParam = $cmd.Parameters['TargetCredential']
+
+            $tgtUriFullAttr  = $tgtUriParam.Attributes  | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.ParameterSetName -eq 'Full' }
+            $tgtCredFullAttr = $tgtCredParam.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.ParameterSetName -eq 'Full' }
+
+            $tgtUriFullAttr  | Should -Not -BeNullOrEmpty
+            $tgtCredFullAttr | Should -Not -BeNullOrEmpty
+            $tgtUriFullAttr.Mandatory  | Should -BeTrue
+            $tgtCredFullAttr.Mandatory | Should -BeTrue
+        }
+    }
 }

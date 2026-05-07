@@ -1,12 +1,36 @@
 function Invoke-VbrMigration {
     <#
     .SYNOPSIS
-        Orchestrates an end-to-end VBR migration: exports all seven resource
-        types from the source server, then imports them into the target
-        server in dependency order.
+        Orchestrates a VBR migration end-to-end OR runs only one of the two
+        stages (export-only / resume-from-import) so an operator can manually
+        verify and edit the exported JSON between stages.
 
     .DESCRIPTION
-        Workflow:
+        The recommended workflow for production migrations is two-stage:
+
+            Stage 1 (on a host that can reach the SOURCE VBR):
+                Invoke-VbrMigration -ExportOnly ...
+            -- exports the seven resources to JSON files in -WorkingDirectory,
+               runs the empty-password check, and stops. No target token is
+               requested. No imports run.
+
+            -- The operator inspects the JSON files, populates every empty
+               password / passphrase / privateKey field, and otherwise edits
+               the files (e.g. retargeting mountServer.mountServerName in
+               repositories.json).
+
+            Stage 2 (on a host that can reach the TARGET VBR):
+                Invoke-VbrMigration -ResumeFromImport ...
+            -- reads the JSON files from -WorkingDirectory, re-runs the
+               empty-password check (so any still-empty passwords are flagged
+               again), then imports all seven resources in dependency order.
+
+        The combined single-pass mode (no -ExportOnly, no -ResumeFromImport)
+        is still supported for callers who already trust the export contents
+        and want to skip the manual verification step. It is NOT the
+        recommended path for production migrations.
+
+        Single-pass workflow:
             1. Get-VbrToken on source.
             2. Export all 7 resources from source (Credentials,
                CloudCredentials, EncryptionPasswords, ManagedServers,
@@ -21,27 +45,78 @@ function Invoke-VbrMigration {
                After each Import-Vbr* call, Wait-VbrAutomationSession on the
                returned session id. Halt on first failure.
 
+        -ExportOnly and -ResumeFromImport are mutually exclusive. They live
+        in distinct PowerShell parameter sets, so the parser will reject any
+        invocation that supplies both.
+
     .PARAMETER SourceBaseUri
         Source VBR server, e.g. https://src.example.com:9419
+        Required for Full and ExportOnly. Not used by ResumeFromImport.
 
     .PARAMETER TargetBaseUri
         Target VBR server.
+        Required for Full and ResumeFromImport. Not used by ExportOnly.
 
     .PARAMETER SourceCredential
         PSCredential for source OAuth password grant.
+        Required for Full and ExportOnly. Not used by ResumeFromImport.
 
     .PARAMETER TargetCredential
         PSCredential for target OAuth password grant.
+        Required for Full and ResumeFromImport. Not used by ExportOnly.
 
     .PARAMETER WorkingDirectory
-        Filesystem directory to drop the seven export JSON files in.
+        Filesystem directory to drop the seven export JSON files in (Stage 1)
+        or read them from (Stage 2). Required in every parameter set.
 
     .PARAMETER SkipCertificateCheck
         Disable TLS verification on both source and target.
 
+    .PARAMETER ExportOnly
+        Stage-1 switch. When set, the function authenticates only to the
+        source, exports the seven resources, persists JSON, runs the
+        empty-password check, and returns. No target token is requested and
+        no Import-Vbr* / Wait-VbrAutomationSession calls are made. Mutually
+        exclusive with -ResumeFromImport (enforced by parameter sets).
+
     .PARAMETER ResumeFromImport
-        If set, skip the export phase and read existing JSON files from
-        -WorkingDirectory.
+        Stage-2 switch. When set, the function reads the seven JSON files
+        from -WorkingDirectory, runs the empty-password check, then imports
+        all seven resources into the target VBR. No source authentication or
+        export is performed. Mutually exclusive with -ExportOnly.
+
+    .EXAMPLE
+        # Recommended two-stage workflow:
+
+        # Stage 1 -- run on a host that can reach the SOURCE VBR.
+        $srcCred = Get-Credential -Message 'Source VBR admin'
+        Invoke-VbrMigration -ExportOnly `
+            -SourceBaseUri    'https://src-vbr.example.com:9419' `
+            -SourceCredential $srcCred `
+            -WorkingDirectory ./migration `
+            -SkipCertificateCheck
+
+        # Inspect ./migration/*.json. Populate every empty password /
+        # passphrase / privateKey field. Retarget mountServer names if
+        # needed. Verify the spec is what you expect on the target.
+
+        # Stage 2 -- run on a host that can reach the TARGET VBR.
+        $tgtCred = Get-Credential -Message 'Target VBR admin'
+        Invoke-VbrMigration -ResumeFromImport `
+            -TargetBaseUri    'https://tgt-vbr.example.com:9419' `
+            -TargetCredential $tgtCred `
+            -WorkingDirectory ./migration `
+            -SkipCertificateCheck
+
+    .EXAMPLE
+        # Single-pass mode (NOT recommended for production migrations):
+        Invoke-VbrMigration `
+            -SourceBaseUri    'https://src:9419' `
+            -TargetBaseUri    'https://tgt:9419' `
+            -SourceCredential $srcCred `
+            -TargetCredential $tgtCred `
+            -WorkingDirectory ./migration `
+            -SkipCertificateCheck
 
     .NOTES
         VBR Automation REST API only supports VMware vSphere primary backup
@@ -49,33 +124,44 @@ function Invoke-VbrMigration {
         AHV, Proxmox, and oVirt jobs are silently dropped at export time and
         cannot be migrated by this orchestrator.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Full')]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Full')]
+        [Parameter(Mandatory, ParameterSetName = 'ExportOnly')]
         [ValidateNotNullOrEmpty()]
         [uri] $SourceBaseUri,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Full')]
+        [Parameter(Mandatory, ParameterSetName = 'ResumeFromImport')]
         [ValidateNotNullOrEmpty()]
         [uri] $TargetBaseUri,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Full')]
+        [Parameter(Mandatory, ParameterSetName = 'ExportOnly')]
         [ValidateNotNull()]
         [pscredential] $SourceCredential,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Full')]
+        [Parameter(Mandatory, ParameterSetName = 'ResumeFromImport')]
         [ValidateNotNull()]
         [pscredential] $TargetCredential,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ParameterSetName = 'Full')]
+        [Parameter(Mandatory, ParameterSetName = 'ExportOnly')]
+        [Parameter(Mandatory, ParameterSetName = 'ResumeFromImport')]
         [ValidateNotNullOrEmpty()]
         [string] $WorkingDirectory,
 
-        [Parameter()]
+        [Parameter(ParameterSetName = 'Full')]
+        [Parameter(ParameterSetName = 'ExportOnly')]
+        [Parameter(ParameterSetName = 'ResumeFromImport')]
         [switch] $SkipCertificateCheck,
 
-        [Parameter()]
+        [Parameter(Mandatory, ParameterSetName = 'ExportOnly')]
+        [switch] $ExportOnly,
+
+        [Parameter(Mandatory, ParameterSetName = 'ResumeFromImport')]
         [switch] $ResumeFromImport
     )
 
@@ -93,9 +179,11 @@ function Invoke-VbrMigration {
         [pscustomobject]@{ Key = 'jobs';                File = 'jobs.json';                Export = 'Export-VbrJobs';               Import = 'Import-VbrJobs'               }
     )
 
-    $exports = @{}
+    $exports      = @{}
+    $writtenFiles = [System.Collections.Generic.List[string]]::new()
+    $setName      = $PSCmdlet.ParameterSetName
 
-    if (-not $ResumeFromImport) {
+    if ($setName -ne 'ResumeFromImport') {
         Write-Verbose ('Invoke-VbrMigration: requesting source token from {0}' -f $SourceBaseUri.AbsoluteUri)
         $srcToken = Get-VbrToken -BaseUri $SourceBaseUri -Credential $SourceCredential -SkipCertificateCheck:$SkipCertificateCheck
 
@@ -109,7 +197,9 @@ function Invoke-VbrMigration {
         }
 
         foreach ($res in $resources) {
-            Write-VbrJsonFile -InputObject $exports[$res.Key] -Path (Join-Path $WorkingDirectory $res.File)
+            $path = Join-Path $WorkingDirectory $res.File
+            Write-VbrJsonFile -InputObject $exports[$res.Key] -Path $path
+            [void]$writtenFiles.Add($path)
         }
     } else {
         foreach ($res in $resources) {
@@ -119,9 +209,22 @@ function Invoke-VbrMigration {
         }
     }
 
-    # Empty-password check -- warn but do NOT throw.
+    # Empty-password check -- warn but do NOT throw. Runs in every mode so
+    # operators see the warning whether they're staging an export, resuming
+    # an import, or single-passing.
     if ($exports.ContainsKey('credentials') -and $exports['credentials']) {
         [void](Test-VbrCredentialPasswords -Spec $exports['credentials'])
+    }
+
+    if ($setName -eq 'ExportOnly') {
+        # Stage-1 stop: contract is "no target auth, no imports". Return the
+        # export manifest so the caller can drive verification tooling.
+        return [pscustomobject]@{
+            SourceBaseUri    = $SourceBaseUri
+            WorkingDirectory = $WorkingDirectory
+            Files            = $writtenFiles.ToArray()
+            Sessions         = $null
+        }
     }
 
     Write-Verbose ('Invoke-VbrMigration: requesting target token from {0}' -f $TargetBaseUri.AbsoluteUri)
