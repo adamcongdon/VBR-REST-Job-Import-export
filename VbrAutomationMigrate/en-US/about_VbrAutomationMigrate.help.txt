@@ -1,0 +1,101 @@
+TOPIC
+    about_VbrAutomationMigrate
+
+SHORT DESCRIPTION
+    Cross-platform PowerShell 7 module that migrates VMware vSphere primary
+    backup jobs between Veeam Backup & Replication v13 servers via the
+    Automation REST API tag (x-api-version: 1.3-rev1).
+
+LONG DESCRIPTION
+    VbrAutomationMigrate replaces a four-year-old set of curl-based working
+    scripts that targeted VBR v11. The new module is a thin REST client
+    for the v13 Automation tag, with one HTTP egress point, strongly typed
+    OAuth2 token handling, full Pester 5 coverage, and source-level
+    anti-pattern guards.
+
+    The end-to-end orchestrator is Invoke-VbrMigration, which authenticates
+    to a source server, exports seven resource categories, persists them as
+    UTF-8 (no BOM) JSON, then authenticates to a target server and imports
+    each resource in dependency order while polling the corresponding
+    Automation session for terminal state.
+
+HARD LIMITATION (READ THIS)
+    The Veeam VBR Automation REST API tag -- even at v13 / 1.3-rev1 --
+    only supports VMware vSphere primary backup jobs. Every other job
+    category is silently dropped at export time and importing them is not
+    possible because the API has no representation for them.
+
+    Unsupported job categories (not bugs -- API limitations):
+      * Backup Copy jobs
+      * Hyper-V backup jobs
+      * Agent (Windows / Linux / Mac) backup jobs
+      * NAS backup jobs
+      * Tape jobs
+      * Replication jobs
+      * VMware Cloud Director jobs
+      * Nutanix AHV / Proxmox / oVirt jobs
+      * Microsoft 365 / SaaS jobs (separate product API)
+
+    If your migration includes any of those, this module will not help.
+
+PUBLIC FUNCTIONS
+    Get-VbrToken                       Obtain an OAuth2 bearer token from
+                                       /api/oauth2/token via password grant.
+    Export-VbrCredentials              Export credentials.
+    Export-VbrCloudCredentials         Export cloud credentials.
+    Export-VbrEncryptionPasswords      Export encryption passwords.
+    Export-VbrManagedServers           Export managed server registrations.
+    Export-VbrRepositories             Export backup repositories.
+    Export-VbrProxies                  Export backup proxies.
+    Export-VbrJobs                     Export VMware backup jobs.
+
+    Import-VbrCredentials              Import credentials.
+    Import-VbrCloudCredentials         Import cloud credentials.
+    Import-VbrEncryptionPasswords      Import encryption passwords.
+    Import-VbrManagedServers           Import managed server registrations.
+    Import-VbrRepositories             Import backup repositories.
+    Import-VbrProxies                  Import backup proxies.
+    Import-VbrJobs                     Import VMware backup jobs.
+
+    Wait-VbrAutomationSession          Poll an import session at
+                                       /api/v1/automation/sessions/{id}
+                                       until terminal state.
+    Test-VbrCredentialPasswords        Detect empty
+                                       password/passphrase/privateKey
+                                       fields and emit Write-Warning.
+    Invoke-VbrMigration                End-to-end orchestrator. Halts on
+                                       first session failure.
+
+REQUIREMENTS
+    * PowerShell 7.4 or later.
+    * Network reachability on TCP/9419 to source and target VBR.
+    * Local administrator credentials on both servers, or any account
+      that can use the OAuth2 password grant.
+
+CONSTITUTIONAL PRINCIPLES
+    1.  PowerShell 7.4+ only.
+    2.  No curl.exe shell-out -- only Invoke-RestMethod.
+    3.  No interactive UI (MessageBox, Read-Host, Out-GridView).
+    4.  Bearer tokens never written to verbose / debug / host streams.
+    5.  No hardcoded credentials in module source.
+    6.  Exactly one x-api-version value: 1.3-rev1.
+    7.  TDD -- every public function has at least one Pester test.
+    8.  ConvertTo-Json -Depth 50 and ConvertFrom-Json -Depth 50 everywhere.
+
+EMPTY PASSWORDS
+    Export-VbrCredentials returns credentials with empty password,
+    passphrase, and privateKey fields -- the API does not export secrets.
+    After import, every flagged credential must be repopulated on the
+    target VBR server before any backup job that uses it will run
+    successfully. Test-VbrCredentialPasswords and Invoke-VbrMigration
+    both surface this with Write-Warning listing the affected names.
+    Migration does NOT auto-fail.
+
+EXAMPLES
+    See README.md and the .EXAMPLE blocks on each public function for
+    typical usage patterns.
+
+SEE ALSO
+    Plans/upgrade-plan.md  -- design rationale and risk register
+    Tests/AntiPatterns.Tests.ps1 -- source-level anti-pattern guards
+    https://helpcenter.veeam.com/  (VBR REST API reference)
