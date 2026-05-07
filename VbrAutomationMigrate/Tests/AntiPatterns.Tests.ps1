@@ -118,4 +118,55 @@ Describe 'Module source must not contain forbidden patterns' {
         }
         $offenders | Should -BeNullOrEmpty -Because 'C4 -- bearer tokens never appear on verbose/debug/host streams.'
     }
+
+    It 'has no Write-VbrLog call that emits a literal "Bearer <something>" pattern' {
+        # Source-level scan: outside the redaction code in Write-VbrLog.ps1
+        # itself, no module file should construct a log message with a literal
+        # "Bearer " followed by a variable or token-bearing expression. The
+        # redaction implementation in Write-VbrLog.ps1 is the single allowed
+        # location for the pattern.
+        $offenders = @()
+        foreach ($path in $script:sourceBag.Keys) {
+            if ([System.IO.Path]::GetFileName($path) -eq 'Write-VbrLog.ps1') { continue }
+            $content = $script:sourceBag[$path]
+            $hits = [regex]::Matches($content, '(?im)Write-VbrLog[^\r\n]*')
+            foreach ($h in $hits) {
+                $line = $h.Value
+                if ($line -match 'Bearer\s+\S') { $offenders += "$path => $($line.Trim())" }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty -Because 'C4 (extended to file log) -- callers never put Bearer values into Write-VbrLog.'
+    }
+
+    It 'has no Write-VbrLog call that passes secret-bearing field names in -Context' {
+        # Source-level scan: -Context @{...} hashtables to Write-VbrLog must
+        # never include keys named password, passphrase, privateKey, Token,
+        # or AccessToken. The empty-password verify path uses the descriptive
+        # key 'empty-password-creds' (a list of names, not values), which is
+        # safe.
+        $forbiddenKeys = @('Token','AccessToken')
+        $forbiddenSecretKeys = @('password','passphrase','privateKey')
+        $offenders = @()
+        foreach ($path in $script:sourceBag.Keys) {
+            if ([System.IO.Path]::GetFileName($path) -eq 'Write-VbrLog.ps1') { continue }
+            $content = $script:sourceBag[$path]
+            # Capture each Write-VbrLog ... -Context @{ ... } block (single line).
+            $hits = [regex]::Matches($content, '(?im)Write-VbrLog[^\r\n]*-Context\s*@\{([^}]*)\}')
+            foreach ($h in $hits) {
+                $body = $h.Groups[1].Value
+                foreach ($k in $forbiddenKeys) {
+                    if ($body -match "(?im)(^|[\s;,])$k\s*=") {
+                        $offenders += "$path => Context contains '$k': $($h.Value.Trim())"
+                    }
+                }
+                foreach ($k in $forbiddenSecretKeys) {
+                    # Match exact key '=' (not 'empty-password-creds' which is a list of names).
+                    if ($body -match "(?im)(^|[\s;,])$k\s*=") {
+                        $offenders += "$path => Context contains '$k': $($h.Value.Trim())"
+                    }
+                }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty -Because 'C4 -- Write-VbrLog -Context must never carry token or secret values.'
+    }
 }

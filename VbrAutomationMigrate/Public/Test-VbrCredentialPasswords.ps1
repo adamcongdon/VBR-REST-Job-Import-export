@@ -62,6 +62,10 @@ function Test-VbrCredentialPasswords {
     if ($offenders.Count -gt 0) {
         $list = ($offenders -join ', ')
         Write-Warning ("Test-VbrCredentialPasswords: $($offenders.Count) credential(s) have no password/passphrase/privateKey: $list. Repopulate them on the target VBR server before backup jobs run.")
+        Write-VbrLog -Level 'Warn' -Phase 'verify' -Context @{
+            'empty-password-creds' = $list
+            count                  = $offenders.Count
+        } -Message 'Empty-password credentials detected'
         return $false
     }
 

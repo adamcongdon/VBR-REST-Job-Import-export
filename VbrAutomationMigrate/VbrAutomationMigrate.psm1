@@ -43,6 +43,15 @@ $script:VbrApiVersion   = '1.3-rev1'
 $script:VbrAcceptHeader = 'application/json'
 
 # ----------------------------------------------------------------------------
+# Module-level log target. Set by Invoke-VbrMigration at run start; cleared in
+# its finally block. When $null, Write-VbrLog is a no-op (so callers running
+# Export-Vbr* / Import-Vbr* directly don't error if no log is configured).
+# Tests can drive Write-VbrLog by passing -Path explicitly without relying on
+# this state.
+# ----------------------------------------------------------------------------
+$script:VbrLogPath = $null
+
+# ----------------------------------------------------------------------------
 # Dot-source Private/ then Public/ in deterministic order.
 # ----------------------------------------------------------------------------
 $privateRoot = Join-Path $PSScriptRoot 'Private'
