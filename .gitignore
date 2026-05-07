@@ -1,0 +1,8 @@
+# Runtime exports from the VBR REST API — must never be committed.
+# These are produced by JobExport.ps1 and may contain credentials,
+# hostnames, cert thumbprints, and other lab/customer data.
+CredExport.json
+JobExport.json
+managedservers.json
+proxies.json
+repos.json
